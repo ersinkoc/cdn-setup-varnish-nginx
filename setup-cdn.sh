@@ -1,5 +1,10 @@
 #!/bin/bash
 
+# Generate a random alphanumeric string
+function generate_random_string() {
+  cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 10 | head -n 1
+}
+
 # Check if Varnish and Nginx are installed
 if ! command -v varnishd &> /dev/null || ! command -v nginx &> /dev/null; then
   echo "Varnish and/or Nginx are not installed. Please install them first."
@@ -38,6 +43,13 @@ else
   backend_proto="http"
 fi
 
+# Ask the user for cache time
+read -p "Enter the cache time in hours (e.g. 24): " cache_time
+cache_time_seconds=$((cache_time * 3600))
+
+# Generate a random purge subdomain
+purge_subdomain="$(generate_random_string).${cdn_subdomain}"
+
 # Create a new Varnish config for the domain
 cat > /etc/varnish/${domain}.vcl << EOF
 vcl 4.0;
@@ -54,12 +66,17 @@ sub vcl_recv {
     } else {
         return (pass);
     }
+
+    # Purge cache
+    if (req.method == "PURGE" && req.http.host == "${purge_subdomain}") {
+        return (purge);
+    }
 }
 
 sub vcl_backend_response {
     if (bereq.url ~ "\.(jpg|jpeg|png|gif)$") {
-        set beresp.ttl = 24h;
-        set beresp.http.Cache-Control = "public, max-age=86400";
+        set beresp.ttl = ${cache_time_seconds}s;
+        set beresp.http.Cache-Control = "public, max-age=${cache_time_seconds}";
     }
 }
 
@@ -76,6 +93,19 @@ cat > /etc/nginx/sites-available/${cdn_subdomain} << EOF
 server {
     listen 80;
     server_name ${cdn_subdomain};
+
+    location / {
+        proxy_pass ${backend_proto}://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+
+server {
+    listen 80;
+    server_name ${purge_subdomain};
 
     location / {
         proxy_pass ${backend_proto}://127.0.0.1:8080;
@@ -120,9 +150,23 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
+
+server {
+    listen 80;
+    server_name ${purge_subdomain};
+
+    location / {
+        proxy_pass ${backend_proto}://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
 EOF
 
 # Reload Nginx to apply the new configuration
 systemctl reload nginx
 
 echo "CDN setup for ${cdn_subdomain} is complete."
+echo "Purge subdomain: ${purge_subdomain}"
